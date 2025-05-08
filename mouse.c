@@ -45,12 +45,16 @@
 #include "board.h"
 #include "GPIO.h"
 #include "NVIC.h"
+#include "FreeRTOS.h"
+#include "queue.h"
+
 /*******************************************************************************
  * Definitions
  ******************************************************************************/
 #define I2C_RELEASE_BUS_COUNT 100U
 BaseType_t g_flag_SW2 = pdFALSE;
 BaseType_t g_flag_SW3 = pdFALSE;
+QueueHandle_t imuQueue;
 
 /*******************************************************************************
  * Prototypes
@@ -59,7 +63,7 @@ void BOARD_InitHardware(void);
 void USB_DeviceClockInit(void);
 void USB_DeviceIsrEnable(void);
 void SensorFXOSinit(void);
-void IMU_task(void);
+void IMU_task(void *pvParameters);
 void Callback_SW2(void);
 void Callback_SW3(void);
 
@@ -85,12 +89,10 @@ extern void HW_TimerControl(uint8_t enable);
  * Variables
  ******************************************************************************/
 
-volatile int16_t xAngle = 0;
-volatile int16_t yAngle = 0;
-
 fxos_data_t sensorData   = {0};
 fxos_handle_t fxosHandle = {0};
 uint8_t dataScale        = 0;
+IMUData_t imuData = {0};
 /* FXOS device address */
 const uint8_t g_accel_address[] = {0x1CU, 0x1DU, 0x1EU, 0x1FU};
 
@@ -197,50 +199,42 @@ void USB_DeviceTaskFn(void *deviceHandle)
 /* Update mouse pointer location. Draw a rectangular rotation*/
 static usb_status_t USB_DeviceHidMouseAction(void)
 {
+
     if(pdTRUE == g_flag_SW2){
-    	g_UsbDeviceHidMouse.buffer[0] = 2U; //Left click?
+    	g_UsbDeviceHidMouse.buffer[0] = 2U; //Left click
     	g_flag_SW2 = pdFALSE;
     }
 
     if(pdTRUE == g_flag_SW3){
-    	g_UsbDeviceHidMouse.buffer[0] = 1U; //Rigth click?
+    	g_UsbDeviceHidMouse.buffer[0] = 1U; //Rigth click
     	g_flag_SW3 = pdFALSE;
     }
 
-    IMU_task();  // Actualiza xAngle y yAngle (globales)
+	int8_t mouseX = (int8_t)((imuData.xAngle - 45) / 4);
+	int8_t mouseY = (int8_t)((imuData.yAngle - 45) / 4);
 
-    int8_t mouseX = 0;
-    int8_t mouseY = 0;
+	if (mouseX > 10){
+		mouseX = 10;
+	}
+	if (mouseX < -10){
+		mouseX = -10;
+	}
+	if (mouseY > 10){
+		mouseY = 10;
+	}
+	if (mouseY < -10){
+		mouseY = -10;
+	}
 
-    // Rango de xAngle/yAngle: 0 a 90 -> Convertimos a -10 a 10
-    // Puedes ajustar este factor para controlar la sensibilidad
-    mouseX = (int8_t)((xAngle - 45) / 4);  // -11 a +11
-    mouseY = (int8_t)((yAngle - 45) / 4);  // -11 a +11
+	g_UsbDeviceHidMouse.buffer[1] = mouseX;
+	g_UsbDeviceHidMouse.buffer[2] = mouseY;
 
-    // Limita a valores permitidos para HID (normalmente de -127 a 127, pero aquí usamos algo más seguro)
-    if (mouseX > 10){
-    	mouseX = 10;
-    }
-    if (mouseX < -10){
-    	mouseX = -10;
-    }
-    if (mouseY > 10){
-    	mouseY = 10;
-    }
-    if (mouseY < -10){
-    	mouseY = -10;
-    }
-
-    g_UsbDeviceHidMouse.buffer[1] = mouseX;     // Movimiento en X
-    g_UsbDeviceHidMouse.buffer[2] = mouseY;     // Movimiento en Y
 
     return USB_DeviceHidSend(g_UsbDeviceHidMouse.hidHandle,
                              USB_HID_MOUSE_ENDPOINT_IN,
                              g_UsbDeviceHidMouse.buffer,
                              USB_HID_MOUSE_REPORT_LENGTH);
 }
-
-
 
 static void i2c_release_bus_delay(void)
 {
@@ -770,6 +764,12 @@ void main(void)
 	NVIC_enable_interrupt_and_priotity(PORTA_IRQ, PRIORITY_4);
 	NVIC_global_enable_interrupts;
 
+	imuQueue = xQueueCreate(5, sizeof(IMUData_t));  // Cola con capacidad para 5 elementos
+	if (imuQueue == NULL)
+	{
+	    PRINTF("Error al crear la cola IMU.\r\n");
+	}
+
 
     if (xTaskCreate(APP_task,                                  /* pointer to the task */
                     "app task",                                /* task name for kernel awareness debugging */
@@ -787,6 +787,14 @@ void main(void)
 #endif
     }
 
+    if (xTaskCreate(IMU_task, "IMU Task", configMINIMAL_STACK_SIZE + 200U, NULL, 4U, NULL) != pdPASS)
+    {
+        PRINTF("IMU task creation failed!.\r\n");
+        while (1)
+            ;
+    }
+
+
     vTaskStartScheduler();
 
 #if (defined(__CC_ARM) || (defined(__ARMCC_VERSION)) || defined(__GNUC__))
@@ -794,38 +802,36 @@ void main(void)
 #endif
 }
 
-void IMU_task(void){
+void IMU_task(void *pvParameters)
+{
+    int16_t xData = 0;
+    int16_t yData = 0;
+    uint16_t xAngle = 0;
+    uint16_t yAngle = 0;
 
-    int16_t xData            = 0;
-    int16_t yData            = 0;
+    while (1)
+    {
+        /* Get new accelerometer data. */
+        if (FXOS_ReadSensorData(&fxosHandle, &sensorData) != kStatus_Success)
+        {
+            PRINTF("\r\nSensor device initialize failed!\r\n");
+        }
 
-	/* Get new accelerometer data. */
-	if (FXOS_ReadSensorData(&fxosHandle, &sensorData) != kStatus_Success)
-	{
-		PRINTF("\r\nSensor device initialize failed!\r\n");
-	}
+        /* Procesar datos */
+        xData = (int16_t)(((uint16_t)sensorData.accelXMSB << 8) | sensorData.accelXLSB) / 4U;
+        yData = (int16_t)(((uint16_t)sensorData.accelYMSB << 8) | sensorData.accelYLSB) / 4U;
 
-	/* Get the X and Y data from the sensor data structure in 14 bit left format data*/
-	xData = (int16_t)((uint16_t)((uint16_t)sensorData.accelXMSB << 8) | (uint16_t)sensorData.accelXLSB) / 4U;
-	yData = (int16_t)((uint16_t)((uint16_t)sensorData.accelYMSB << 8) | (uint16_t)sensorData.accelYLSB) / 4U;
+        xAngle = (int16_t)floor((double)xData * (double)dataScale * 90 / 8192);
+        if (xAngle < 0)
+            xAngle *= -1;
 
-	/* Convert raw data to angle (normalize to 0-90 degrees). No negative angles. */
-	xAngle = (int16_t)floor((double)xData * (double)dataScale * 90 / 8192);
-	if (xAngle < 0)
-	{
-		xAngle *= -1;
-	}
-	yAngle = (int16_t)floor((double)yData * (double)dataScale * 90 / 8192);
-	if (yAngle < 0)
-	{
-		yAngle *= -1;
-	}
+        yAngle = (int16_t)floor((double)yData * (double)dataScale * 90 / 8192);
+        if (yAngle < 0)
+            yAngle *= -1;
 
-	/* Update the duty cycle of PWM */
-	Board_UpdatePwm(xAngle, yAngle);
-
-	/* Print out the angle data. */
-	PRINTF("x= %2d y = %2d\r\n", xAngle, yAngle);
+       imuData.xAngle = xAngle;
+       imuData.yAngle = yAngle;
+    }
 }
 
 void SensorFXOSinit(void){

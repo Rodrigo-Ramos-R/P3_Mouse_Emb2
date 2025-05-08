@@ -86,6 +86,12 @@ typedef struct _usb_hid_mouse_struct
 #endif
 } usb_hid_mouse_struct_t;
 
+typedef struct {
+    int16_t xAngle;
+    int16_t yAngle;
+} IMUData_t;
+
+
 /*******************************************************************************
  * API
  ******************************************************************************/
